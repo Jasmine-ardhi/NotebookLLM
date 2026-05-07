@@ -1,216 +1,237 @@
-# NotebookLM Clone — RAG Pipeline
+# 📚 NotebookLM Clone — RAG-Powered Document Chat
 
-A full RAG (Retrieval-Augmented Generation) application built with Node.js, React, and Anthropic Claude. Upload any PDF or text document and chat with it — answers come only from your document, not from the LLM's general knowledge.
+A full **Retrieval-Augmented Generation (RAG)** application where users can upload any document and have a natural language conversation with it. Answers are grounded strictly in the document's content — not hallucinated from general knowledge.
 
-## Live Demo
-
-- **Frontend**: [Deploy to Vercel](#deployment)
-- **Backend**: [Deploy to Railway](#deployment)
+**🌐 Live Demo:** [https://notebook-llm-ashen.vercel.app](https://notebook-llm-ashen.vercel.app)  
+**⚙️ Backend API:** [https://notebookllm-loix.onrender.com](https://notebookllm-loix.onrender.com)
 
 ---
 
-## RAG Pipeline Architecture
+## 🎯 What It Does
+
+Upload a PDF or TXT file → ask questions in plain English → get answers sourced directly from your document.
+
+---
+
+## 🏗️ RAG Pipeline
 
 ```
-User uploads PDF/TXT
-        │
-        ▼
-┌─────────────────────────────────────────────────────┐
-│  1. INGESTION                                        │
-│     • pdf-parse extracts raw text from PDF           │
-│     • TXT files read as UTF-8                        │
-└──────────────────────┬──────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────┐
-│  2. CHUNKING  (Sliding Window Strategy)              │
-│     • Split on sentence boundaries (.  !  ?)         │
-│     • Chunk size: ~1200 characters                   │
-│     • Overlap: ~200 characters between chunks        │
-│     • Preserves context across chunk boundaries      │
-└──────────────────────┬──────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────┐
-│  3. EMBEDDING  (TF-IDF Bag-of-Words)                 │
-│     • Build vocabulary from all chunks (top 2000 words)│
-│     • Remove stopwords (100+ common English words)   │
-│     • Compute TF-IDF weighted vectors per chunk      │
-│     • IDF scores penalize overly common terms        │
-│     • Zero external API needed for embeddings        │
-└──────────────────────┬──────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────┐
-│  4. STORAGE  (In-Memory Vector Store)                │
-│     • Chunks + embeddings stored in JS array         │
-│     • Each entry: { text, embedding[], chunkIndex }  │
-└──────────────────────┬──────────────────────────────┘
-                       │  User asks question
-                       ▼
-┌─────────────────────────────────────────────────────┐
-│  5. RETRIEVAL  (Cosine Similarity Search)            │
-│     • Query tokenized with same TF-IDF pipeline      │
-│     • Cosine similarity computed vs all chunks       │
-│     • Top-5 most relevant chunks selected            │
-│     • Relevance scores shown to user                 │
-└──────────────────────┬──────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────┐
-│  6. GENERATION  (Claude Sonnet via Anthropic API)    │
-│     • System prompt includes top-5 chunks as context │
-│     • Strict instruction: only answer from context   │
-│     • Streaming response for real-time display       │
-│     • Multi-turn conversation history supported      │
-└─────────────────────────────────────────────────────┘
+Upload PDF / TXT
+      │
+      ▼
+┌─────────────────────────────────────────┐
+│  1. INGESTION                           │
+│     pdf-parse extracts raw text         │
+└──────────────────┬──────────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────┐
+│  2. CHUNKING  (Sliding Window)          │
+│     • Split on sentence boundaries      │
+│     • Chunk size : ~1200 characters     │
+│     • Overlap    : ~200 characters      │
+└──────────────────┬──────────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────┐
+│  3. EMBEDDING  (TF-IDF)                 │
+│     • Top-2000 word vocabulary          │
+│     • Stopword removal                  │
+│     • TF-IDF weighted vectors           │
+└──────────────────┬──────────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────┐
+│  4. STORAGE  (In-Memory Vector Store)   │
+│     • Array of { text, embedding[] }    │
+└──────────────────┬──────────────────────┘
+                   │  user asks a question
+                   ▼
+┌─────────────────────────────────────────┐
+│  5. RETRIEVAL  (Cosine Similarity)      │
+│     • Query embedded with same TF-IDF   │
+│     • Top-5 chunks selected             │
+└──────────────────┬──────────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────┐
+│  6. GENERATION  (Groq — Llama 3.3 70B)  │
+│     • Context injected into prompt      │
+│     • Streamed response to frontend     │
+│     • Answers only from document        │
+└─────────────────────────────────────────┘
 ```
 
 ---
 
-## Chunking Strategy
+## 🧩 Chunking Strategy
 
-**Sliding Window Chunking** — the core strategy used:
+**Sliding Window with Sentence-Boundary Overlap**
 
-- **Why sentence boundaries?** Splitting mid-sentence loses semantic context. We use regex `(?<=[.!?])\s+` to split on natural sentence ends.
-- **Chunk size (~1200 chars / ~200 words)**: Large enough for meaningful context, small enough for precision retrieval.
-- **Overlap (~200 chars)**: The tail of each chunk overlaps with the start of the next. This prevents answers that span a chunk boundary from being missed.
-- **Result**: A document of ~10,000 words → ~40–60 overlapping chunks.
+The text is split using a regex that detects natural sentence endings (`.` `!` `?`). Chunks are built by accumulating sentences up to ~1200 characters. When a chunk is full, the last ~200 characters are carried over into the next chunk as overlap. This prevents answers that span a chunk boundary from being missed.
+
+| Parameter | Value |
+|-----------|-------|
+| Chunk size | 1200 characters |
+| Overlap | 200 characters |
+| Split boundary | Sentence ends (`[.!?]`) |
 
 ---
 
-## Tech Stack
+## 🛠️ Tech Stack
 
 | Layer | Technology |
 |-------|-----------|
-| Backend | Node.js + Express |
-| LLM | Anthropic Claude Sonnet (claude-sonnet-4-5) |
-| PDF Parsing | pdf-parse |
-| Embedding | TF-IDF (no external API) |
-| Vector DB | In-memory cosine similarity store |
 | Frontend | React + Vite |
-| Streaming | SSE (Server-Sent Events) |
-
-### Why Anthropic instead of OpenAI?
-- Free tier available at [console.anthropic.com](https://console.anthropic.com)
-- Claude Sonnet 4.5 is state-of-the-art for document Q&A
-- Built-in streaming support
-- Superior instruction-following (stays grounded in context)
-
-### Why TF-IDF instead of neural embeddings?
-- **Zero cost** — no embedding API needed
-- Works without any external service
-- Deterministic and explainable
-- Sufficient for document search (BM25 is still competitive with neural embeddings for many tasks)
+| Backend | Node.js + Express |
+| LLM | Groq API — `llama-3.3-70b-versatile` (free) |
+| Embeddings | TF-IDF (no external API) |
+| Vector Store | In-memory cosine similarity |
+| PDF Parsing | `pdf-parse` |
+| Streaming | Server-Sent Events (SSE) |
+| Frontend Deploy | Vercel |
+| Backend Deploy | Render |
 
 ---
 
-## Local Setup
+## 🚀 Local Setup
 
 ### Prerequisites
 - Node.js 18+
-- Anthropic API key (free at [console.anthropic.com](https://console.anthropic.com))
+- Free Groq API key → [console.groq.com](https://console.groq.com)
 
-### 1. Clone and install
+### 1. Clone the repo
+
 ```bash
-git clone https://github.com/YOUR_USERNAME/notebooklm-rag
+git clone https://github.com/YOUR_USERNAME/notebooklm-rag.git
 cd notebooklm-rag
-
-# Install backend deps
-cd backend && npm install && cd ..
-
-# Install frontend deps
-cd frontend && npm install && cd ..
 ```
 
-### 2. Configure environment
+### 2. Backend setup
+
 ```bash
-# Backend
-cp backend/.env.example backend/.env
-# Edit backend/.env and add your ANTHROPIC_API_KEY
-
-# Frontend (optional for local dev — Vite proxy handles it)
-cp frontend/.env.example frontend/.env
+cd backend
+npm install
+cp .env.example .env
 ```
 
-### 3. Run
+Open `.env` and add your key:
+
+```env
+GROQ_API_KEY=your_groq_api_key_here
+PORT=3001
+```
+
+Start the backend:
+
 ```bash
-# Terminal 1 — Backend
-cd backend && npm run dev
-
-# Terminal 2 — Frontend  
-cd frontend && npm run dev
+npm run dev
+# ✅ RAG server running on port 3001 (using Groq)
 ```
 
-Open [http://localhost:5173](http://localhost:5173)
+### 3. Frontend setup
+
+```bash
+cd frontend
+npm install
+cp .env.example .env
+```
+
+Open `.env` and set:
+
+```env
+VITE_API_URL=http://localhost:3001
+```
+
+Start the frontend:
+
+```bash
+npm run dev
+# Open http://localhost:5173
+```
 
 ---
 
-## Deployment
+## 🌍 Deployment
 
-### Backend → Railway
+### Backend → Render
 
-1. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub
-2. Select the `backend/` folder (or set root to `/backend`)
-3. Add environment variable: `ANTHROPIC_API_KEY=your_key`
-4. Railway auto-detects Node.js and deploys
+1. Go to [render.com](https://render.com) → **New Web Service** → connect your GitHub repo
+2. Set **Root Directory** to `backend`
+3. Set **Build Command** to `npm install`
+4. Set **Start Command** to `npm start`
+5. Add environment variable: `GROQ_API_KEY = your_key_here`
+6. Deploy → your backend URL will be `https://your-app.onrender.com`
 
 ### Frontend → Vercel
 
-1. Go to [vercel.com](https://vercel.com) → New Project → Import from GitHub
-2. Set **Root Directory** to `frontend/`
-3. Add environment variable: `VITE_API_URL=https://your-backend.railway.app`
+1. Go to [vercel.com](https://vercel.com) → **New Project** → import from GitHub
+2. Set **Root Directory** to `frontend`
+3. Add environment variable: `VITE_API_URL = https://your-app.onrender.com`
 4. Deploy
 
 ---
 
-## Project Structure
+## 📁 Project Structure
 
 ```
 notebooklm-rag/
 ├── backend/
-│   ├── server.js          # Express server + full RAG pipeline
+│   ├── server.js          # Express server — full RAG pipeline
 │   ├── package.json
-│   ├── railway.toml       # Railway deployment config
 │   └── .env.example
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx        # React UI — upload + chat interface
+│   │   ├── App.jsx        # Upload + chat UI
 │   │   ├── main.jsx
 │   │   └── index.css
 │   ├── index.html
-│   ├── vite.config.js     # Dev proxy to backend
-│   ├── vercel.json        # Vercel deployment config
+│   ├── vite.config.js
 │   └── package.json
 └── README.md
 ```
 
 ---
 
-## Assignment Checklist
+## ✅ Assignment Checklist
 
-- [x] User can upload a PDF or plain text file
-- [x] System chunks the document (sliding window, sentence-aware)
-- [x] System embeds chunks (TF-IDF vectors)
-- [x] Embeddings indexed in vector store (in-memory with cosine similarity)
-- [x] User can ask natural language questions
-- [x] System retrieves top-5 most relevant chunks
-- [x] LLM (Claude) generates answers grounded in document context
-- [x] System prompt explicitly restricts LLM to document content only
-- [x] Multi-turn conversation supported
-- [x] Source chunks shown to user (transparency)
-- [x] Works on documents it has never seen before
-- [x] Clean, working web UI
-- [x] Free API key (Anthropic)
+| Requirement | Status |
+|-------------|--------|
+| Upload PDF or TXT | ✅ |
+| Chunking strategy implemented | ✅ Sliding window with overlap |
+| Embeddings generated | ✅ TF-IDF vectors |
+| Vector store used | ✅ In-memory cosine similarity |
+| Relevant chunks retrieved | ✅ Top-5 by cosine score |
+| LLM answers from context only | ✅ Groq Llama 3.3 70B |
+| Multi-turn conversation | ✅ |
+| Source chunks shown to user | ✅ |
+| Working frontend | ✅ React + Vite |
+| Live deployed project | ✅ Vercel + Render |
 
 ---
 
-## Marking Scheme Coverage
+## 📌 Environment Variables
 
-| Criterion | Implementation |
-|-----------|---------------|
-| GitHub Repository | This repo |
-| Live Project | Vercel + Railway deployment |
-| RAG Pipeline | Full pipeline in `backend/server.js` |
-| Answer Quality | System prompt enforces context-only answers |
-| Code Quality | Modular functions, documented, readable |
+### Backend (`backend/.env`)
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `GROQ_API_KEY` | Free API key from [console.groq.com](https://console.groq.com) | ✅ Yes |
+| `PORT` | Server port (default: 3001) | No |
+
+### Frontend (`frontend/.env`)
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `VITE_API_URL` | Backend URL (empty string for local dev with Vite proxy) | For production |
+
+---
+
+## 🔑 Getting a Free Groq API Key
+
+1. Go to [console.groq.com](https://console.groq.com)
+2. Sign up for a free account
+3. Navigate to **API Keys** → **Create API Key**
+4. Copy the key and paste it into `backend/.env`
+
+Groq's free tier includes generous rate limits and access to `llama-3.3-70b-versatile` — one of the most capable open models available.
