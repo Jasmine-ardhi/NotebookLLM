@@ -7,6 +7,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import OpenAI from "openai";
 import pdfParse from "pdf-parse/lib/pdf-parse.js";
+import { QdrantClient } from "@qdrant/js-client-rest";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -23,13 +24,18 @@ const client = new OpenAI({
   baseURL: "https://api.groq.com/openai/v1",
 });
 
-// ─── In-memory vector store (cosine similarity) ───────────────────────────────
-// Structure: { id, text, embedding, metadata: { pageNum, chunkIndex } }
-let vectorStore = [];
+// ─── Qdrant Client ────────────────────────────────────────────────────────────
+const qdrant = new QdrantClient({
+  url: process.env.QDRANT_URL || "http://localhost:6333",
+  ...(process.env.QDRANT_API_KEY && { apiKey: process.env.QDRANT_API_KEY }),
+});
+
+const COLLECTION = "notebooklm";
+
 let documentTitle = "";
+let currentVectorSize = 0; // ← tracks actual vocab size after buildVocab()
 
 // ─── Chunking Strategy: Sliding Window with Overlap ───────────────────────────
-// Chunk size: 500 tokens (~400 words), Overlap: 100 tokens (~80 words)
 function chunkText(text, chunkSize = 1200, overlap = 200) {
   const chunks = [];
   const sentences = text.split(/(?<=[.!?])\s+/);
@@ -40,7 +46,6 @@ function chunkText(text, chunkSize = 1200, overlap = 200) {
     const sentence = sentences[i];
     if ((current + " " + sentence).length > chunkSize && current.length > 0) {
       chunks.push({ text: current.trim(), chunkIndex });
-      // Overlap: rewind by ~overlap chars
       let overlap_text = current.slice(-overlap);
       current = overlap_text + " " + sentence;
       chunkIndex++;
@@ -54,7 +59,7 @@ function chunkText(text, chunkSize = 1200, overlap = 200) {
   return chunks;
 }
 
-// ─── TF-IDF Bag-of-Words Embedding (No external API required) ────────────────
+// ─── TF-IDF Bag-of-Words Embedding ────────────────────────────────────────────
 const idfCache = {};
 let totalDocs = 0;
 
@@ -93,19 +98,26 @@ let globalVocab = [];
 
 function buildVocab(chunks) {
   const freq = {};
+  // Reset IDF cache for new document
+  Object.keys(idfCache).forEach(k => delete idfCache[k]);
+
   chunks.forEach(({ text }) => {
     const tokens = tokenize(text);
     tokens.forEach((t) => (freq[t] = (freq[t] || 0) + 1));
-    // Update IDF cache
     const unique = new Set(tokens);
     unique.forEach((t) => (idfCache[t] = (idfCache[t] || 0) + 1));
   });
   totalDocs = chunks.length;
-  // Top 2000 most frequent words as vocab
+
+  // Use however many unique words exist — cap at 2000
   globalVocab = Object.entries(freq)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 2000)
     .map(([w]) => w);
+
+  // ── KEY FIX: track the REAL vocab size ──────────────────────────────────────
+  currentVectorSize = globalVocab.length;
+  console.log(`📐 Vocab built: ${currentVectorSize} unique words`);
 }
 
 function tfidfEmbedding(text) {
@@ -148,26 +160,38 @@ app.post("/upload", upload.single("document"), async (req, res) => {
       return res.status(400).json({ error: "Document appears to be empty or unreadable" });
     }
 
-    // Reset store
-    vectorStore = [];
     documentTitle = originalname;
 
-    // Chunk
+    // 1. Chunk
     const chunks = chunkText(rawText);
 
-    // Build vocab for TF-IDF
+    // 2. Build vocab — this sets currentVectorSize to the REAL vocab length
     buildVocab(chunks);
 
-    // Embed and store
-    for (const chunk of chunks) {
-      const embedding = tfidfEmbedding(chunk.text);
-      vectorStore.push({ ...chunk, embedding });
-    }
+    // 3. Recreate Qdrant collection using the ACTUAL vocab size ← KEY FIX
+    await qdrant.recreateCollection(COLLECTION, {
+      vectors: { size: currentVectorSize, distance: "Cosine" },
+    });
+    console.log(`✅ Qdrant collection recreated with vector size: ${currentVectorSize}`);
+
+    // 4. Embed all chunks and upsert
+    const points = chunks.map((chunk, i) => ({
+      id: i,
+      vector: tfidfEmbedding(chunk.text),
+      payload: {
+        text: chunk.text,
+        chunkIndex: chunk.chunkIndex,
+      },
+    }));
+
+    await qdrant.upsert(COLLECTION, { wait: true, points });
+
+    console.log(`✅ Indexed "${originalname}" → ${points.length} chunks in Qdrant`);
 
     res.json({
       success: true,
       documentTitle: originalname,
-      totalChunks: vectorStore.length,
+      totalChunks: points.length,
       previewText: rawText.slice(0, 300) + "...",
     });
   } catch (err) {
@@ -182,23 +206,32 @@ app.post("/chat", async (req, res) => {
     console.log("📩 Received chat request");
     console.log("API Key present?", !!process.env.GROQ_API_KEY);
     console.log("API Key starts with:", process.env.GROQ_API_KEY?.substring(0, 10));
-    
+
     const { question, history = [] } = req.body;
     console.log("Question:", question);
-    
-    if (!question) return res.status(400).json({ error: "Question required" });
-    if (vectorStore.length === 0) return res.status(400).json({ error: "No document loaded. Please upload a document first." });
 
-    // Embed query
+    if (!question) return res.status(400).json({ error: "Question required" });
+
+    // Check Qdrant has data
+    const info = await qdrant.getCollection(COLLECTION).catch(() => null);
+    if (!info || info.points_count === 0) {
+      return res.status(400).json({ error: "No document loaded. Please upload a document first." });
+    }
+
+    // Embed query using the same vocab built during upload
     const queryEmbedding = tfidfEmbedding(question);
 
-    // Retrieve top-k chunks (k=5)
-    const scored = vectorStore.map((chunk) => ({
-      ...chunk,
-      score: cosineSimilarity(queryEmbedding, chunk.embedding),
+    // Retrieve top-5 chunks from Qdrant
+    const searchResults = await qdrant.search(COLLECTION, {
+      vector: queryEmbedding,
+      limit: 5,
+      with_payload: true,
+    });
+
+    const topChunks = searchResults.map(hit => ({
+      text: hit.payload.text,
+      score: hit.score,
     }));
-    scored.sort((a, b) => b.score - a.score);
-    const topChunks = scored.slice(0, 5);
 
     const context = topChunks
       .map((c, i) => `[Chunk ${i + 1} | Relevance: ${(c.score * 100).toFixed(1)}%]\n${c.text}`)
@@ -230,21 +263,20 @@ ${context}`
     res.setHeader("Connection", "keep-alive");
 
     console.log("🚀 Starting Groq API stream...");
-    console.log("Model: llama-3.3-70b-versatile");
-    
+
     const stream = await client.chat.completions.create({
-      model: "llama-3.3-70b-versatile", // Fast and capable model
+      model: "llama-3.3-70b-versatile",
       messages,
       max_tokens: 1024,
       temperature: 0.3,
       stream: true,
     });
-    
+
     console.log("✅ Stream created successfully");
 
     let fullText = "";
     let chunkCount = 0;
-    
+
     for await (const chunk of stream) {
       chunkCount++;
       const content = chunk.choices[0]?.delta?.content;
@@ -253,7 +285,7 @@ ${context}`
         res.write(`data: ${JSON.stringify({ text: content })}\n\n`);
       }
     }
-    
+
     console.log(`✅ Stream completed. Received ${chunkCount} chunks, ${fullText.length} chars`);
 
     res.write(`data: ${JSON.stringify({ done: true, chunks: topChunks.map(c => ({ text: c.text.slice(0, 150) + "...", score: c.score })) })}\n\n`);
@@ -261,19 +293,23 @@ ${context}`
   } catch (err) {
     console.error("❌ Chat error:", err);
     console.error("Error details:", err.message);
-    console.error("Full error:", JSON.stringify(err, null, 2));
     res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
     res.end();
   }
 });
 
 // GET /status
-app.get("/status", (req, res) => {
-  res.json({
-    documentLoaded: vectorStore.length > 0,
-    documentTitle,
-    totalChunks: vectorStore.length,
-  });
+app.get("/status", async (req, res) => {
+  try {
+    const info = await qdrant.getCollection(COLLECTION);
+    res.json({
+      documentLoaded: info.points_count > 0,
+      documentTitle,
+      totalChunks: info.points_count,
+    });
+  } catch {
+    res.json({ documentLoaded: false, documentTitle, totalChunks: 0 });
+  }
 });
 
-app.listen(PORT, () => console.log(`🚀 RAG server running on port ${PORT} (using Groq)`));
+app.listen(PORT, () => console.log(`🚀 RAG server running on port ${PORT} (using Groq + Qdrant)`));
